@@ -16,7 +16,7 @@
 //! HTTP client for the Kraken Futures REST API.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     num::NonZeroU32,
     sync::{
@@ -26,6 +26,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
@@ -89,6 +90,12 @@ use crate::{
 pub const KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND: u32 = 5;
 
 const KRAKEN_GLOBAL_RATE_KEY: &str = "kraken:futures:global";
+
+/// Caps the order-event pagination so a startup read cannot run unbounded.
+///
+/// The loop below follows the venue's continuation token. A venue that kept returning one would
+/// otherwise leave a startup reconciliation read spinning. Mirrors `MAX_REPORT_PAGES` on spot.
+const MAX_ORDER_EVENT_PAGES: usize = 500;
 
 /// Maximum orders per batch cancel request for Kraken Futures API.
 const BATCH_CANCEL_LIMIT: usize = 50;
@@ -1828,47 +1835,91 @@ impl KrakenFuturesHttpClient {
             // Kraken Futures order events API expects Unix timestamp in milliseconds
             let start_ms = start.map(|dt| dt.as_millisecond());
             let end_ms = end.map(|dt| dt.as_millisecond());
-            let response = self
-                .inner
-                .get_order_events(end_ms, start_ms, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("get_order_events failed: {e}"))?;
 
-            for event_wrapper in response.order_events {
-                let event = &event_wrapper.order;
+            // The venue still reports these as open, so their current state is authoritative and a
+            // replayed event must not displace it.
+            let open_order_ids: HashSet<VenueOrderId> = all_reports
+                .iter()
+                .map(|report| report.venue_order_id)
+                .collect();
 
-                if let Some(ref target_id) = instrument_id {
-                    let instrument = self.get_cached_instrument(&target_id.symbol.inner());
-                    if let Some(inst) = instrument
-                        && inst.raw_symbol().as_str() != event.symbol
-                    {
-                        continue;
-                    }
-                }
+            // One report per order, the latest by `ts_last`. `ExecutionMassStatus` keys reports by
+            // venue order ID, so emitting every event would let arrival order decide which state
+            // survives.
+            let mut latest: IndexMap<VenueOrderId, OrderStatusReport> = IndexMap::new();
+            let mut continuation_token: Option<String> = None;
+            let mut pages = 0;
 
-                if let Some(instrument) = self.get_instrument_by_raw_symbol(&event.symbol) {
-                    match parse_futures_order_event_status_report(
-                        event,
-                        Some(event_wrapper.event_type),
-                        &instrument,
-                        account_id,
-                        ts_init,
-                    ) {
-                        Ok(report) => all_reports.push(report),
-                        Err(e) => {
-                            let order_id = &event.order_id;
-                            log::warn!("Failed to parse futures order event {order_id}: {e}");
-                            complete = false;
-                        }
-                    }
-                } else {
+            loop {
+                if pages >= MAX_ORDER_EVENT_PAGES {
                     log::warn!(
-                        "Instrument not in cache for futures symbol {}, skipping order event",
-                        event.symbol
+                        "Order events pagination hit the cap of {MAX_ORDER_EVENT_PAGES} pages; returning a truncated set and marking it incomplete"
                     );
                     complete = false;
+                    break;
+                }
+
+                let response = self
+                    .inner
+                    .get_order_events(end_ms, start_ms, continuation_token.as_deref())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("get_order_events failed: {e}"))?;
+                pages += 1;
+
+                for event_wrapper in &response.order_events {
+                    let event = &event_wrapper.order;
+
+                    if let Some(ref target_id) = instrument_id {
+                        let instrument = self.get_cached_instrument(&target_id.symbol.inner());
+                        if let Some(inst) = instrument
+                            && inst.raw_symbol().as_str() != event.symbol
+                        {
+                            continue;
+                        }
+                    }
+
+                    if let Some(instrument) = self.get_instrument_by_raw_symbol(&event.symbol) {
+                        match parse_futures_order_event_status_report(
+                            event,
+                            Some(event_wrapper.event_type),
+                            &instrument,
+                            account_id,
+                            ts_init,
+                        ) {
+                            Ok(report) => {
+                                if open_order_ids.contains(&report.venue_order_id) {
+                                    continue;
+                                }
+
+                                match latest.get(&report.venue_order_id) {
+                                    Some(existing) if existing.ts_last >= report.ts_last => {}
+                                    _ => {
+                                        latest.insert(report.venue_order_id, report);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let order_id = &event.order_id;
+                                log::warn!("Failed to parse futures order event {order_id}: {e}");
+                                complete = false;
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "Instrument not in cache for futures symbol {}, skipping order event",
+                            event.symbol
+                        );
+                        complete = false;
+                    }
+                }
+
+                match response.continuation_token {
+                    Some(token) if !token.is_empty() => continuation_token = Some(token),
+                    _ => break,
                 }
             }
+
+            all_reports.extend(latest.into_values());
         }
 
         Ok((all_reports, complete))
